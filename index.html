@@ -208,8 +208,8 @@ const ENEMY_TYPES = {
 // 玩家各等级火力参数
 function playerFireStats(power) {
   return {
-    maxBullets: Math.min(1 + power, 3),
-    fireDelay: Math.max(0.45 - power * 0.07, 0.16),
+    maxBullets: Math.min(2 + power, 4),
+    fireDelay: Math.max(0.26 - power * 0.05, 0.12),
     strong: power >= 2,
   };
 }
@@ -255,6 +255,8 @@ function freshState() {
     lives: 3,
     map: [],
     baseAlive: true,
+    baseHp: 10,
+    baseMaxHp: 10,
     player: null,
     enemies: [],
     bullets: [],
@@ -263,7 +265,8 @@ function freshState() {
     enemyQueue: [],
     maxOnScreen: 3,
     spawnTimer: 1.2,
-    freezeTimer: 0,          // 关卡切换 / 死亡 的暂停计时
+    freezeTimer: 0,          // 死亡重生暂停
+    levelClearTimer: 0,      // 过关切换暂停
     overTimer: 0,            // 基地被毁后的延迟
     shake: 0,
     pickupStar: 0.25,        // 敌人掉落道具概率
@@ -325,7 +328,7 @@ function rectBlocksTank(rect) {
 function makePlayer() {
   return {
     x: 4 * TS + OFF, y: 12 * TS + OFF, w: TANK, h: TANK,
-    dir: 0, desired: 0, speed: 95, cooldown: 0,
+    dir: 0, desired: 0, speed: 130, cooldown: 0,
     power: 0, invincibleUntil: 0, alive: true,
     color: "#e8d44a", hitFlash: 0,
   };
@@ -337,14 +340,20 @@ function makeEnemy(type, col) {
     x: col * TS + OFF, y: OFF, w: TANK, h: TANK,
     dir: 2, speed: t.speed, hp: t.hp, type,
     color: t.color, score: t.score, fireDelay: t.fireDelay,
-    cooldown: 500 + Math.random() * 1500,
-    turnTimer: 600 + Math.random() * 1200,
+    cooldown: 400 + Math.random() * 1200,
     hitFlash: 0,
+    alive: true,
+    // AI：fast/power 偏向追击玩家，basic/armor 偏向主攻基地
+    mode: (type === "fast" || type === "power")
+      ? (Math.random() < 0.7 ? "player" : "base")
+      : (Math.random() < 0.35 ? "player" : "base"),
+    decideCooldown: 0,
+    stuckTime: 0,
   };
 }
 
 function makeBullet(owner, x, y, dir, strong) {
-  return { owner, x, y, dir, strong, w: BULLET, h: BULLET, speed: owner === "player" ? 340 : 260 };
+  return { owner, x, y, dir, strong, w: BULLET, h: BULLET, speed: owner === "player" ? 340 : 260, active: true };
 }
 
 function addExplosion(x, y, size = 1, color = "#ffb054") {
@@ -360,7 +369,7 @@ function makeEnemyQueue(level) {
     let t = "basic";
     if (level >= 4 && r > 0.86) t = "armor";
     else if (level >= 3 && r > 0.62) t = "power";
-    else if (level >= 2 && r > 0.36) t = "fast";
+    else if (r > 0.78) t = "fast";
     list.push(t);
   }
   return list;
@@ -382,45 +391,112 @@ function spawnEnemy() {
 
 function updateEnemy(e, dt) {
   e.cooldown -= dt * 1000;
-  e.turnTimer -= dt * 1000;
+  e.decideCooldown -= dt * 1000;
   e.hitFlash = Math.max(0, e.hitFlash - dt * 1000);
 
-  // AI：优先朝玩家方向，被阻挡或计时到就随机转向
-  const p = state.player;
-  const dxp = p.x - e.x, dyp = p.y - e.y;
-  let targetDir = e.dir;
-  if (Math.random() < 0.01) {
-    targetDir = (Math.abs(dxp) > Math.abs(dyp))
-      ? (dxp > 0 ? 1 : 3)
-      : (dyp > 0 ? 2 : 0);
-  }
-  if (e.turnTimer <= 0 || wouldBlock(e, e.dir)) {
-    e.turnTimer = 500 + Math.random() * 1800;
-    const opts = [0,1,2,3].filter(d => d !== opposite(e.dir) && !wouldBlock(e, d));
-    targetDir = opts.length ? opts[(Math.random() * opts.length) | 0] : opposite(e.dir);
-  }
-  // 转弯需对齐格子
-  if (targetDir !== e.dir) {
-    if (targetDir === opposite(e.dir)) e.dir = targetDir;
-    else if (alignedTo(e, targetDir)) e.dir = targetDir;
+  // 处于格子交叉点时，朝目标（玩家/基地）重新选路
+  if (enemyAtNode(e) && e.decideCooldown <= 0) {
+    e.decideCooldown = 150;
+    chooseEnemyDir(e, false);
   }
 
+  // 移动；若被卡住则强制换向
+  const ox = e.x, oy = e.y;
   moveTank(e, dt);
-
-  // 开火
-  if (e.cooldown <= 0) {
-    e.cooldown = e.fireDelay * (0.7 + Math.random() * 0.6);
-    if (lineOfSightToPlayer(e)) fireBullet(e, "enemy");
+  if (e.x === ox && e.y === oy) {
+    e.stuckTime += dt;
+    if (e.stuckTime > 0.4) { e.stuckTime = 0; chooseEnemyDir(e, true); }
+  } else {
+    e.stuckTime = 0;
   }
+
+  // 开火：优先攻击玩家，其次攻击基地，再者清障开路
+  if (e.cooldown <= 0) enemyTryFire(e);
 }
 
-function lineOfSightToPlayer(e) {
-  // 仅在正对玩家方向且大致同列/行时开火，避免无脑乱射
+// 敌人是否正处于某个格子的中心（用于转向决策）
+function enemyAtNode(e) {
+  return Math.abs(e.x - gridCenter(e.x)) < 6 && Math.abs(e.y - gridCenter(e.y)) < 6;
+}
+
+// 某格是否可通行（无地形阻挡且无其它坦克占据）
+function cellPassable(c, r, self) {
+  if (!inBounds(c, r)) return false;
+  if (TANK_BLOCK.has(tileAt(c, r))) return false;
+  const rect = { x: c * TS + OFF, y: r * TS + OFF, w: TANK, h: TANK };
+  if (state.player.alive && overlap(state.player, rect)) return false;
+  return !state.enemies.some(o => o !== self && o.alive && overlap(o, rect));
+}
+
+// 目标（玩家/基地）的像素中心
+function targetPoint(e) {
+  if (e.mode === "player" && state.player.alive) {
+    return { x: state.player.x + TANK / 2, y: state.player.y + TANK / 2 };
+  }
+  return { x: 6 * TS + TS / 2, y: 12 * TS + TS / 2 }; // 基地中心
+}
+
+// 朝目标贪婪寻路：在可通行方向里选最接近目标者
+function chooseEnemyDir(e, force) {
+  const tp = targetPoint(e);
+  const cc = Math.round((e.x - OFF) / TS), cr = Math.round((e.y - OFF) / TS);
+  const opts = [0, 1, 2, 3].filter(d => {
+    if (!force && d === opposite(e.dir)) return false;
+    return cellPassable(cc + DX[d], cr + DY[d], e);
+  });
+  if (!opts.length && !force) {
+    const back = opposite(e.dir);
+    if (cellPassable(cc + DX[back], cr + DY[back], e)) opts.push(back);
+  }
+  if (!opts.length) return; // 四面被围，原地待命
+  let best = opts[0], bestD = Infinity;
+  for (const d of opts) {
+    const nc = cc + DX[d], nr = cr + DY[d];
+    const dist = Math.abs(nc * TS + TS / 2 - tp.x) + Math.abs(nr * TS + TS / 2 - tp.y) + Math.random() * 4;
+    if (dist < bestD) { bestD = dist; best = d; }
+  }
+  e.dir = best;
+}
+
+// 判断 to 是否与 from 对齐且位于 dir 方向
+function alignedWith(from, to, dir) {
+  if (dir === 0) return Math.abs(from.x - to.x) < 12 && to.y < from.y;
+  if (dir === 2) return Math.abs(from.x - to.x) < 12 && to.y > from.y;
+  if (dir === 3) return Math.abs(from.y - to.y) < 12 && to.x < from.x;
+  return Math.abs(from.y - to.y) < 12 && to.x > from.x;
+}
+
+// 坦克车头正前方的那一格
+function cellAhead(e) {
+  if (e.dir === 0) return { c: Math.floor((e.x + e.w / 2) / TS), r: Math.floor((e.y - 1) / TS) };
+  if (e.dir === 2) return { c: Math.floor((e.x + e.w / 2) / TS), r: Math.floor((e.y + e.h + 1) / TS) };
+  if (e.dir === 3) return { c: Math.floor((e.x - 1) / TS), r: Math.floor((e.y + e.h / 2) / TS) };
+  return { c: Math.floor((e.x + e.w + 1) / TS), r: Math.floor((e.y + e.h / 2) / TS) };
+}
+
+function enemyTryFire(e) {
+  const eC = { x: e.x + TANK / 2, y: e.y + TANK / 2 };
   const p = state.player;
-  if (e.dir === 0) return Math.abs(p.x - e.x) < 10 && p.y < e.y;
-  if (e.dir === 2) return Math.abs(p.x - e.x) < 10 && p.y > e.y;
-  if (e.dir === 1) return Math.abs(p.y - e.y) < 10 && p.x > e.x;
-  return Math.abs(p.y - e.y) < 10 && p.x < e.x;
+
+  // 1) 与玩家对齐且朝向玩家 → 攻击
+  if (p.alive && alignedWith(eC, { x: p.x + TANK / 2, y: p.y + TANK / 2 }, e.dir)) {
+    fireBullet(e, "enemy");
+    e.cooldown = e.fireDelay * (0.55 + Math.random() * 0.55);
+    return;
+  }
+  // 2) 与基地对齐且朝向基地 → 攻击
+  if (alignedWith(eC, { x: 6 * TS + TS / 2, y: 12 * TS + TS / 2 }, e.dir)) {
+    fireBullet(e, "enemy");
+    e.cooldown = e.fireDelay * (0.8 + Math.random() * 0.6);
+    return;
+  }
+  // 3) 前方是砖墙/钢板 → 开路
+  const a = cellAhead(e);
+  const t = tileAt(a.c, a.r);
+  if (t === T.BRICK || t === T.STEEL) {
+    fireBullet(e, "enemy");
+    e.cooldown = e.fireDelay * (0.9 + Math.random() * 0.7);
+  }
 }
 
 /* ================= 移动与碰撞 ================= */
@@ -432,15 +508,6 @@ function alignedTo(t, dir) {
 
 function overlap(a, b) {
   return a.x < b.x + b.w && a.x + a.w > b.x && a.y < b.y + b.h && a.y + a.h > b.y;
-}
-
-function wouldBlock(t, dir) {
-  const nx = t.x + DX[dir] * t.speed * 0.05, ny = t.y + DY[dir] * t.speed * 0.05;
-  const r = { x: nx, y: ny, w: t.w, h: t.h };
-  if (r.x < 0 || r.y < 0 || r.x + r.w > COLS * TS || r.y + r.h > ROWS * TS) return true;
-  if (rectBlocksTank(r)) return true;
-  const others = state.enemies.concat(state.player);
-  return others.some(o => o !== t && o.alive && overlap(o, r));
 }
 
 function moveTank(t, dt) {
@@ -484,9 +551,8 @@ function updatePlayer(dt) {
     p.desired = d;
     if (d === opposite(p.dir)) p.dir = d;
     else if (d !== p.dir && alignedTo(p, d)) p.dir = d;
+    moveTank(p, dt);
   }
-
-  moveTank(p, dt);
 
   p.cooldown -= dt;
   if ((keys.Space || keys.KeyJ) && p.cooldown <= 0) {
@@ -526,7 +592,7 @@ function updateBullets(dt) {
         if (b.strong) { state.map[r][c] = T.EMPTY; addExplosion(c*TS+TS/2, r*TS+TS/2, 0.8, "#9ac"); }
         sfx.hit();
       } else if (tile === T.BASE) {
-        destroyBase(); return;
+        damageBase(); return;
       }
       continue;
     }
@@ -578,6 +644,20 @@ function killPlayer() {
   sfx.explode();
   state.lives--;
   state.freezeTimer = 1.0;
+}
+
+function damageBase() {
+  if (!state.baseAlive) return;
+  state.baseHp--;
+  // 受击特效
+  for (let r = 0; r < ROWS; r++)
+    for (let c = 0; c < COLS; c++)
+      if (state.map[r][c] === T.BASE) {
+        addExplosion(c * TS + TS / 2, r * TS + TS / 2, 0.8, "#ffd24a");
+      }
+  sfx.hit();
+  state.shake = Math.max(state.shake, 0.15);
+  if (state.baseHp <= 0) destroyBase();
 }
 
 function destroyBase() {
@@ -645,11 +725,13 @@ function startGame() {
   state = freshState();
   state.screen = "playing";
   beginLevel(1);
+  hideOverlay();
 }
 
 function beginLevel(n) {
   state.level = n;
   state.baseAlive = true;
+  state.baseHp = state.baseMaxHp;
   loadLevel(n);
   state.player = makePlayer();
   state.enemies = [];
@@ -659,13 +741,9 @@ function beginLevel(n) {
   state.enemyQueue = makeEnemyQueue(n);
   state.spawnTimer = 1.0;
   state.freezeTimer = 0;
+  state.levelClearTimer = 0;
   state.overTimer = 0;
   state.maxOnScreen = Math.min(3 + Math.floor(n / 3), 5);
-}
-
-function advanceLevel() {
-  state.freezeTimer = 2.0;
-  state.screen = "clear";
 }
 
 function gameOver() {
@@ -674,11 +752,11 @@ function gameOver() {
     state.hiScore = state.score;
     localStorage.setItem("tank_hi", state.hiScore);
   }
-  showOverlay();
+  refreshOverlayText();
 }
 
 function togglePause() {
-  if (state.screen === "playing") { state.screen = "paused"; showOverlay(); }
+  if (state.screen === "playing") { state.screen = "paused"; refreshOverlayText(); }
   else if (state.screen === "paused") { state.screen = "playing"; hideOverlay(); }
 }
 
@@ -696,21 +774,32 @@ function frame(now) {
 }
 
 function step(dt) {
+  // 基地被毁后的短暂延迟，再进入结算
+  if (state.overTimer > 0) {
+    state.overTimer -= dt;
+    updateExplosions(dt);
+    if (state.overTimer <= 0) { gameOver(); return; }
+    return;
+  }
+
+  // 过关后的短暂停顿，再进入下一关
+  if (state.levelClearTimer > 0) {
+    state.levelClearTimer -= dt;
+    updateExplosions(dt);
+    if (state.levelClearTimer <= 0) beginLevel(state.level + 1);
+    return;
+  }
+
+  // 玩家死亡后的重生停顿
   if (state.freezeTimer > 0) {
     state.freezeTimer -= dt;
-    // 玩家死亡后的重生
-    if (!state.player.alive && state.freezeTimer <= 0) {
+    updateExplosions(dt);
+    if (state.freezeTimer <= 0 && !state.player.alive) {
       if (state.lives <= 0) { gameOver(); return; }
       state.player = makePlayer();
       state.player.invincibleUntil = performance.now() + 2000;
     }
-    render(); return;
-  }
-
-  // 基地被毁
-  if (state.overTimer > 0) {
-    state.overTimer -= dt;
-    if (state.overTimer <= 0) { gameOver(); return; }
+    return;
   }
 
   updatePlayer(dt);
@@ -732,12 +821,22 @@ function step(dt) {
   state.shake = Math.max(0, state.shake - dt);
 
   // 过关判定
-  if (!state.enemyQueue.length && !state.enemies.length && state.baseAlive && state.screen === "playing") {
-    advanceLevel();
+  if (state.baseAlive && !state.enemyQueue.length && !state.enemies.length) {
+    state.levelClearTimer = 2.0;
   }
 }
 
 /* ================= 渲染 ================= */
+function drawCenterBanner(text) {
+  ctx.fillStyle = "rgba(0,0,0,0.6)";
+  ctx.fillRect(0, ROWS * TS / 2 - 42, COLS * TS, 84);
+  ctx.fillStyle = "#f0b53d";
+  ctx.font = "bold 32px 'Microsoft YaHei', 'Segoe UI', sans-serif";
+  ctx.textAlign = "center";
+  ctx.textBaseline = "middle";
+  ctx.fillText(text, COLS * TS / 2, ROWS * TS / 2);
+}
+
 function render() {
   ctx.save();
   if (state.shake > 0) {
@@ -761,6 +860,7 @@ function render() {
   for (const [c, r] of trees) drawTree(c * TS, r * TS);
 
   ctx.restore();
+  if (state.levelClearTimer > 0) drawCenterBanner(`第 ${state.level} 关通过`);
   drawHUD();
 }
 
@@ -773,7 +873,7 @@ function drawGround() {
       if (t === T.BRICK) drawBrick(x, y);
       else if (t === T.STEEL) drawSteel(x, y);
       else if (t === T.WATER) drawWater(x, y);
-      else if (t === T.BASE) drawBase(x, y, state.baseAlive);
+      else if (t === T.BASE) drawBase(x, y, state.baseAlive, state.baseHp, state.baseMaxHp);
     }
   }
 }
@@ -822,7 +922,7 @@ function drawTree(x, y) {
   ctx.fill();
 }
 
-function drawBase(x, y, alive) {
+function drawBase(x, y, alive, hp, maxHp) {
   // 基座
   ctx.fillStyle = "#6b4f2a";
   ctx.fillRect(x + 3, y + TS - 9, TS - 6, 6);
@@ -841,6 +941,15 @@ function drawBase(x, y, alive) {
   }
 
   const cx = x + TS / 2;
+
+  // 生命值条
+  const bw = TS - 6, bh = 4;
+  const pct = Math.max(0, hp / maxHp);
+  ctx.fillStyle = "rgba(0,0,0,0.7)";
+  ctx.fillRect(x + 3, y - 8, bw, bh);
+  ctx.fillStyle = pct > 0.3 ? "#5be05b" : "#ff5a5a";
+  ctx.fillRect(x + 3, y - 8, bw * pct, bh);
+
   // 鹰身
   ctx.fillStyle = "#f4d264";
   ctx.beginPath();
@@ -1055,26 +1164,11 @@ function refreshOverlayText() {
     ovBtn.style.display = "none";
     ovPause.style.display = "";
     showOverlay();
-  } else if (state.screen === "clear") {
-    ovTitle.textContent = `第 ${state.level} 关通过！`;
-    ovSub.textContent = "准备进入下一关…";
-    ovBtn.style.display = "none";
-    ovPause.style.display = "none";
-    showOverlay();
   }
 }
 
 ovBtn.addEventListener("click", () => { initAudio(); handlePrimaryAction(); });
 ovPause.addEventListener("click", () => togglePause());
-
-// 关卡切换：短暂提示后自动开始下一关
-setInterval(() => {
-  if (state.screen === "clear" && state.freezeTimer <= 0) {
-    beginLevel(state.level + 1);
-    state.screen = "playing";
-    hideOverlay();
-  }
-}, 100);
 
 /* ================= 启动 ================= */
 function init() {
